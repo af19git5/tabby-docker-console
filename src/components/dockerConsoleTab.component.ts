@@ -1,5 +1,7 @@
 import { ChangeDetectorRef, Component, ElementRef, Input, Injector, OnDestroy, OnInit, ViewChild } from '@angular/core'
+import { DomSanitizer, SafeHtml } from '@angular/platform-browser'
 import { AppService, BaseTabComponent, NotificationsService } from 'tabby-core'
+import { AnsiLine, parseAnsiLines, stripAnsi } from '../ansi'
 import { DockerContainer, DockerImage, DockerStats } from '../models'
 import { RemoteDockerService } from '../services/remoteDocker.service'
 
@@ -423,7 +425,7 @@ type FilterState = 'all' | 'running' | 'exited' | 'paused'
                            [(ngModel)]="logsFilter">
                 </div>
 
-                <pre class="dc-logs" #logsEl>{{ filteredLogs }}</pre>
+                <pre class="dc-logs" #logsEl [innerHTML]="filteredLogsHtml"></pre>
             </ng-container>
 
         </div>
@@ -574,6 +576,37 @@ type FilterState = 'all' | 'running' | 'exited' | 'paused'
         .dc-logs-filter-input::placeholder { color: var(--theme-fg-less-2, rgba(204,204,204,0.4)); }
 
         .dc-logs { flex: 1; margin: 0; padding: 12px 16px; font-family: 'Menlo', 'Monaco', 'Consolas', monospace; font-size: 11px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; overflow-y: auto; color: var(--theme-fg, #cccccc); background: transparent; }
+        /*
+         * Log pane colors — taken from the IntelliJ IDEA color scheme "Dark green" (Dark_green.icls).
+         * Explicit scheme values: background, normal output, red, blue, magenta, cyan.
+         * Everything else is inherited from the scheme's parent ("Default"), exactly as IDEA does.
+         * ANSI → IDEA key mapping: 30 BLACK, 31-36 RED…CYAN, 37 GRAY, 90 DARKGRAY, 91-96 *_BRIGHT, 97 WHITE.
+         * Keys the scheme overrides with only a FOREGROUND reuse that color as their background.
+         */
+        .dc-logs {
+            font-family: 'Menlo', 'Monaco', 'Consolas', monospace;
+            font-size: 12px;
+            color: #e0e2e4;
+            background: #293134;
+            --dc-ansi-default-fg: #e0e2e4;
+            --dc-ansi-default-bg: #293134;
+            --dc-ansi-0:  #000000;  --dc-ansi-bg-0:  #000000;  /* BLACK          */
+            --dc-ansi-1:  #ff6b68;  --dc-ansi-bg-1:  #ff6b68;  /* RED            */
+            --dc-ansi-2:  #067d17;  --dc-ansi-bg-2:  #b5e7be;  /* GREEN          */
+            --dc-ansi-3:  #b28c00;  --dc-ansi-bg-3:  #f7e79f;  /* YELLOW         */
+            --dc-ansi-4:  #5394ec;  --dc-ansi-bg-4:  #5394ec;  /* BLUE           */
+            --dc-ansi-5:  #983498;  --dc-ansi-bg-5:  #983498;  /* MAGENTA        */
+            --dc-ansi-6:  #006969;  --dc-ansi-bg-6:  #006969;  /* CYAN           */
+            --dc-ansi-7:  #929292;  --dc-ansi-bg-7:  #e6e6e6;  /* GRAY           */
+            --dc-ansi-8:  #656565;  --dc-ansi-bg-8:  #b7b7b7;  /* DARKGRAY       */
+            --dc-ansi-9:  #ff1616;  --dc-ansi-bg-9:  #fe7277;  /* RED_BRIGHT     */
+            --dc-ansi-10: #16b42c;  --dc-ansi-bg-10: #85f399;  /* GREEN_BRIGHT   */
+            --dc-ansi-11: #ecc32c;  --dc-ansi-bg-11: #ffe055;  /* YELLOW_BRIGHT  */
+            --dc-ansi-12: #2d61f0;  --dc-ansi-bg-12: #95c2ff;  /* BLUE_BRIGHT    */
+            --dc-ansi-13: #e617e6;  --dc-ansi-bg-13: #fbacfb;  /* MAGENTA_BRIGHT */
+            --dc-ansi-14: #15c1c1;  --dc-ansi-bg-14: #8cf1f1;  /* CYAN_BRIGHT    */
+            --dc-ansi-15: #c9c9c9;  --dc-ansi-bg-15: #ffffff;  /* WHITE          */
+        }
 
         /* ── Stats view ──────────────────────────────────────── */
         .dc-stats-error { padding: 30px 20px; display: flex; align-items: center; justify-content: center; gap: 8px; color: #f87171; font-size: 12px; }
@@ -639,6 +672,12 @@ export class DockerConsoleTabComponent extends BaseTabComponent implements OnIni
     logsAutoRefresh = true
     logsRefreshInterval = 3
     private logsRefreshTimer: any = null
+    /** Cache: parsed ANSI lines for the current `containerLogs`. */
+    private parsedLogsSource: string | null = null
+    private parsedLogLines: AnsiLine[] = []
+    /** Cache: rendered HTML for the current (logs, filter) pair. */
+    private renderedLogsKey: string | null = null
+    private renderedLogsHtml: SafeHtml = ''
 
     containerStats: DockerStats | null = null
     statsLoading = false
@@ -652,6 +691,7 @@ export class DockerConsoleTabComponent extends BaseTabComponent implements OnIni
         private notify: NotificationsService,
         private cdr: ChangeDetectorRef,
         private app: AppService,
+        private sanitizer: DomSanitizer,
     ) {
         // The devDependency typings declare `constructor()`, but the runtime
         // BaseTabComponent requires an Injector argument.  The mismatch is a
@@ -738,15 +778,44 @@ export class DockerConsoleTabComponent extends BaseTabComponent implements OnIni
         )
     }
 
-    get filteredLogs (): string {
-        if (!this.logsFilter.trim()) {
-            return this.containerLogs || '(no output)'
+    /**
+     * Log output rendered as HTML with ANSI colors applied.
+     * Filtering matches against the plain text (escape codes removed) of each line.
+     * Results are cached so change detection doesn't re-parse on every tick.
+     */
+    get filteredLogsHtml (): SafeHtml {
+        if (this.parsedLogsSource !== this.containerLogs) {
+            const lines = parseAnsiLines(this.containerLogs || '')
+            // Drop the trailing empty line produced by the final newline.
+            if (lines.length && lines[lines.length - 1].text === '') {
+                lines.pop()
+            }
+            this.parsedLogLines = lines
+            this.parsedLogsSource = this.containerLogs
+            this.renderedLogsKey = null
         }
-        const q = this.logsFilter.toLowerCase()
-        return this.containerLogs
-            .split('\n')
-            .filter(line => line.toLowerCase().includes(q))
-            .join('\n') || '(no matching lines)'
+
+        const filtering = !!this.logsFilter.trim()
+        const key = filtering ? this.logsFilter.toLowerCase() : ''
+        if (this.renderedLogsKey === key) {
+            return this.renderedLogsHtml
+        }
+
+        const lines = filtering
+            ? this.parsedLogLines.filter(l => l.text.toLowerCase().includes(key))
+            : this.parsedLogLines
+
+        let html: string
+        if (lines.length) {
+            html = lines.map(l => l.html).join('\n')
+        } else {
+            html = `<span style="opacity:0.5">${filtering ? '(no matching lines)' : '(no output)'}</span>`
+        }
+
+        // Safe: parseAnsiLines HTML-escapes all log text; only our own <span style> tags remain.
+        this.renderedLogsHtml = this.sanitizer.bypassSecurityTrustHtml(html)
+        this.renderedLogsKey = key
+        return this.renderedLogsHtml
     }
 
     displayName (names: string): string {
@@ -980,7 +1049,7 @@ export class DockerConsoleTabComponent extends BaseTabComponent implements OnIni
         const name = this.displayName(this.selectedContainer.names)
         const ts = new Date().toISOString().replace(/[:.]/g, '-')
         const filename = `${name}-${ts}.log`
-        const blob = new Blob([this.containerLogs], { type: 'text/plain' })
+        const blob = new Blob([stripAnsi(this.containerLogs)], { type: 'text/plain' })
         const url = URL.createObjectURL(blob)
         const a = document.createElement('a')
         a.href = url
